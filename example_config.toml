@@ -1,0 +1,202 @@
+
+
+field_name       = 'cosmos'
+
+# list of str, lowercase 
+filters = ['f115w'] 
+
+# which files to reduce. list of str, wildcards acceptable 
+# can be * if you want to do everything in data_dir
+files = ['jw01727*', 'jw05893*']
+
+[environment]
+    CRDS_SERVER_URL = "https://jwst-crds.stsci.edu"
+    CRDS_PATH = "/n23data2/hakins/jwst/crds/1331/" # <-- change!
+    CRDS_CONTEXT = "jwst_1331.pmap"
+
+[performance]
+    bottleneck = true 
+
+[directory_structure]
+    base_dir             = '/n23data2/hakins/jwst/' # <-- change!
+    data_dir             = 'data' # where raw data is stored (within base_dir), assumed each filter has subdirectory, i.e., {base_dir}/{data_dir}/f444w/*_uncal.fits
+    product_dir          = 'products' # where reduced products will go (within base_dir)
+    stage1_product_dir   = 'pipeline_level1' # subdirectory (within product_dir) for stage1 products
+    stage2_product_dir   = 'pipeline_level2' # subdirectory (within product_dir) for stage2 products
+    stage3_product_dir   = 'pipeline_level3' # subdirectory (within product_dir) for stage3 products
+    mosaic_dir           = 'mosaics' # where final mosiacs will go (within base_dir)
+
+    reference_dir        = 'reference_data' # where various reference data is stored (within base_dir)
+    bad_pixel_dir        = 'bad_pixels' # where bad pixel masks will be saved (within reference_dir)
+    refcat_dir           = 'astrom_cats' # where reference astrometric catalogs are stored (within reference_dir)
+    wisp_dir             = 'wisps/stsci_v3' # where wisp templates are stored (within reference_dir)
+    claw_dir             = 'claws' # TBD, not yet implemented, will probably become generic "masks"
+
+####################################################################################
+################################# Pipeline stage 1 #################################
+####################################################################################
+[stage1]
+    run = true # Do stage 1 processing? Must be true for any stage1 steps to run
+
+[stage1.detector1_step]
+    run = true # Do JWST pipeline stage 1 processing? 
+    overwrite = false # overwrite existing _rate.fits files? 
+
+[stage1.remove_snowball_step]
+    run = true # Mask snowballs using `snowblind`
+    max_fraction = 0.3  # Maximum allowed fraction of flagged pixels relative to the total
+    new_jump_flag = 1024 # Integer DQ flag of identified snowballs
+    min_radius = 4 # Minimum radius of ``JUMP_DET`` flagged groups of pixels
+    growth_factor = 1.5 # Scale factor of the DQ mask
+
+[stage1.remove_wisp_step]
+    run = true # Remove wisps by subtracting STScI wisp templates?
+    apply_flat = true
+    plot = true
+
+[stage1.remove_striping_step]
+    run = true # Remove 1/f noise following Bagley+
+    pool = true
+    apply_flat = true
+    mask_sources = true
+    save_mask = true
+    maskparam = 'none'
+    subtract_background = true
+    maxiters = 3
+    plot = true
+
+[stage1.persistence_step]
+    run = true # Flag pixels affected by persistence, using `snowblind`
+
+####################################################################################
+################################# Pipeline stage 2 #################################
+####################################################################################
+[stage2]
+    run = true # Do stage 2 processing? Must be true for any stage2 steps to run
+
+[stage2.image2_step]
+    run = true # Do JWST pipeline stage 2 processing? 
+    overwrite = true # overwrite existing _cal.fits files? 
+
+[stage2.remove_edge_step]
+    run = true # Mask pixels at the edges (not sure if this is necessary)
+
+[stage2.remove_claw_step]
+    run = false # TBD, not yet implemented, will probably become generic "mask regions" step
+    plot = true 
+
+[stage2.bkgsub_var_step]
+    run = true # Perform background subtraction and variance map rescaling on cal.fits files, following Bagley+
+    plot = true
+    pool = true
+    overwrite = false
+    ring_radius_in = 40
+    ring_width = 3
+    ring_clip_max_sigma = 5.0
+    ring_clip_box_size = 100  
+    ring_clip_filter_size = 3
+    tier_kernel_size = [25, 15, 5, 2]
+    tier_npixels = [15, 15, 5, 2]
+    tier_nsigma = [3, 3, 3, 3]
+    tier_dilate_size = [0, 0, 0, 3]
+    bg_box_size = 10
+    bg_filter_size = 5
+    bg_exclude_percentile = 90
+    bg_sigma = 3
+    bg_interpolator = 'zoom'
+    block_size = 7
+
+####################################################################################
+################################# Pipeline stage 3 #################################
+####################################################################################
+### Pipeline stage 3
+[stage3]
+    run = false # Do pipeline stage 3 processing? Must be true for any stage3 steps to run
+
+[stage3.jhat_step]
+    run = true # Run astrometric alignment with JHAT?
+    pool = true # Parallelize? 
+    verbose = true
+    debug = true
+    overwrite = false
+    rough_cut_px_min = 2.5 
+    rough_cut_px_max = 2.5 
+    d_rotated_Nsigma = 3.0 
+    iterate_with_xyshifts = true
+    d2d_max = 1.5
+    sip_err = 1.0
+    objmag_lim = [19, 28]
+    delta_mag_lim = [-3, 4]
+    histocut_order = 'dxdy'
+    saveplots = true
+    savephottable = true
+    
+    [stage3.jhat_step.refcat_dict]
+        f115w = 'astrom_refcat_A_and_B_tot_8may.ecsv' # <- refernce catalogs generated by Max
+        f150w = 'astrom_refcat_A_and_B_tot_8may.ecsv'
+        f200w = 'astrom_refcat_A_and_B_tot_8may.ecsv'
+        f277w = 'astrom_refcat_cosmos2020_cat_jhat.ecsv'
+        f356w = 'astrom_refcat_cosmos2020_cat_jhat.ecsv'
+        f410m = 'astrom_refcat_cosmos2020_cat_jhat.ecsv'
+        f444w = 'astrom_refcat_cosmos2020_cat_jhat.ecsv'
+
+[stage3.bad_pixel_step]
+    run = false # Build bad pixel masks by stacking DQ masks from all files for a given filter/detector
+    threshold = 0.2 # If a pixel is flagged in >20% of files, flag it always
+    overwrite = true
+
+[stage3.skymatch_step]
+    run = false # Run JWST pipeline skymatch step?
+    skymethod = 'match'
+    match_down = true
+    subtract = true 
+    stepsize = 'none'
+    skystat = 'mode'
+    dqbits = '~DO_NOT_USE+NON_SCIENCE'
+    lower = 'none'
+    upper = 'none'
+    nclip = 10 
+    binwidth = 0.1
+
+[stage3.outlier_step]
+    run = false # Run JWST pipeline outlier step?
+    overwrite = false
+    max_radius = 20
+    good_bits = '~DO_NOT_USE'
+    weight_type = 'ivm'
+    pixfrac = 1.0
+    kernel = 'square'
+    fillval = 'INDEF'
+    maskpt = 0.1
+    scale = '1.2 0.7'
+    snr = '3.0 2.0'
+    backg = 0.0
+    resample_data = true
+
+[stage3.resample_step]
+    run = false
+    mode = 'tile' # `tile` or `indiv` -- currently only `tile` supported
+    tile = 'B2' 
+    pixel_scale = '60mas'
+    version = 'v0_1'
+    mosaic_name = 'mosaic_nircam_[filter]_[field_name]_[pixel_scale]_[version]_[tile]'  # valid keywords: [filter], [field_name], [pixel_scale], [version], [tile]
+    pixfrac = 1
+    kernel = 'square'
+    background_subtract = true # run an additional background subtraction routine on the mosaics? 
+    ring_radius_in = 80
+    ring_width = 4
+    ring_clip_max_sigma = 5.0
+    ring_clip_box_size = 100  
+    ring_clip_filter_size = 3
+    tier_kernel_size = [25, 15, 5, 2]
+    tier_npixels = [15, 10, 3, 1]
+    tier_nsigma = [1.5, 1.5, 1.5, 1.5]
+    tier_dilate_size = [33, 25, 21, 19]
+    bg_box_size = 10
+    bg_filter_size = 5
+    bg_exclude_percentile = 90
+    bg_sigma = 3
+    bg_interpolator = 'zoom'
+    split_extensions = true # split _i2d files into separate files for sci, wht, err (easier to manage)
+
+

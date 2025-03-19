@@ -1,0 +1,8 @@
+astropy
+photutils
+numpy
+matplotlib
+scipy
+tqdm
+toml
+dotmap
