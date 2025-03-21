@@ -12,8 +12,9 @@ from astropy.io import fits
 from astropy.nddata import block_reduce
 from astropy.stats import biweight_location, biweight_midvariance
 from .stage1 import calc_variance
+import warnings
 
-
+from regions import Regions
 from astropy.convolution import (Tophat2DKernel, 
                                  Gaussian2DKernel, 
                                  Ring2DKernel, 
@@ -146,6 +147,37 @@ def remove_edge(cal_file):
 ################################################################################################
 # TBD, claw removal will be replaced with generic routine to apply masks defined by region files 
 ################################################################################################
+def apply_masks(cal_file):
+    cal_file_name = os.path.basename(cal_file)
+    filtname = cal_file.split('/')[-2]
+    reg_file = os.path.join(config.mask_path, filtname, cal_file_name.replace('_cal.fits', '.reg'))
+    if not os.path.exists(reg_file):
+        logger.info(f'No mask found for {cal_file_name}, skipping')
+        return 
+
+    flag = config.stage2.apply_mask_step.mask_flag
+    logger.info(f'Applying mask to {cal_file_name}')
+    from jwst.datamodels import ImageModel
+    with ImageModel(cal_file) as model:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            wcs = model.get_fits_wcs()
+        shape = np.shape(model.data)
+
+        regs = Regions.read(reg_file)
+        for reg in regs:
+            reg = reg.to_pixel(wcs)
+            mask = reg.to_mask(mode='center')
+            mask = mask.to_image(shape)
+            mask = (mask*flag).astype('uint32')
+
+            model.dq |= mask
+        
+        model.save(cal_file)
+
+    
+
+
 # def remove_claws(cal_file):
 #     plot = config.stage2.remove_claw_step.plot
 
@@ -471,8 +503,6 @@ import os, glob, tqdm
 import matplotlib.pyplot as plt
 from astropy.io import fits
 from astropy.visualization import ImageNormalize, ZScaleInterval
-# import warnings
-# warnings.simplefilter('ignore')
 
 def plot_cal_mask(cal_file):
     outfile = os.path.join('/n23data2/hakins/jwst/scripts/f150w_cal_files/', os.path.basename(cal_file).replace('_cal.fits','.png'))

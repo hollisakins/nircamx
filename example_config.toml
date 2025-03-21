@@ -30,7 +30,7 @@ files = ['jw01727*', 'jw05893*']
     bad_pixel_dir        = 'bad_pixels' # where bad pixel masks will be saved (within reference_dir)
     refcat_dir           = 'astrom_cats' # where reference astrometric catalogs are stored (within reference_dir)
     wisp_dir             = 'wisps/stsci_v3' # where wisp templates are stored (within reference_dir)
-    claw_dir             = 'claws' # TBD, not yet implemented, will probably become generic "masks"
+    mask_dir             = 'masks' # where mask regions are stored (within reference_dir)
 
 ####################################################################################
 ################################# Pipeline stage 1 #################################
@@ -81,10 +81,6 @@ files = ['jw01727*', 'jw05893*']
 [stage2.remove_edge_step]
     run = true # Mask pixels at the edges (not sure if this is necessary)
 
-[stage2.remove_claw_step]
-    run = false # TBD, not yet implemented, will probably become generic "mask regions" step
-    plot = true 
-
 [stage2.bkgsub_var_step]
     run = true # Perform background subtraction and variance map rescaling on cal.fits files, following Bagley+
     plot = true
@@ -105,6 +101,10 @@ files = ['jw01727*', 'jw05893*']
     bg_sigma = 3
     bg_interpolator = 'zoom'
     block_size = 7
+
+[stage2.apply_mask_step]
+    run = false # Apply masks (reg files) stored in mask_dir
+    mask_flag = 1024
 
 ####################################################################################
 ################################# Pipeline stage 3 #################################

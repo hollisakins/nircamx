@@ -7,3 +7,6 @@ nircamx/__pycache__/*
 nircamx/nircamx.egg-info
 nircamx/nircamx.egg-info/
 nircamx/nircamx.egg-info/*
+nircamx.egg-info
+nircamx.egg-info/
+nircamx.egg-info/*

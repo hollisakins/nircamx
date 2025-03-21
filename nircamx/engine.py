@@ -127,15 +127,6 @@ def main():
                     print(pool.map(remove_edge, cal_files))
 
 
-        if config.stage2.remove_claw_step.run:
-            from .stage2 import remove_claws
-
-            for filtname in config.filters:
-                cal_files = utils.get_cal_files(filtname)
-                
-                with mp.Pool(utils.n_procs) as pool:
-                    print(pool.map(remove_claws, cal_files))
-
         
         # variance_step
         if config.stage2.bkgsub_var_step.run:
@@ -149,6 +140,15 @@ def main():
                 else:
                     for cal_file in cal_files:
                         background_subtraction_variance_scaling(cal_file)
+
+        if config.stage2.apply_mask_step.run:
+            from .stage2 import apply_masks
+
+            for filtname in config.filters:
+                cal_files = utils.get_cal_files(filtname)
+                
+                with mp.Pool(utils.n_procs) as pool:
+                    print(pool.map(apply_masks, cal_files))
 
 
     if config.stage3.run:

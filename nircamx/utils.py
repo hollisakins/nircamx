@@ -53,8 +53,8 @@ def parse_config_file(config_file):
     cfg.refcat_path = os.path.join(cfg.reference_path, cfg.refcat_dir)
     cfg.wisp_dir = cfg.directory_structure.wisp_dir
     cfg.wisp_path = os.path.join(cfg.reference_path, cfg.wisp_dir)
-    cfg.claw_dir = cfg.directory_structure.claw_dir
-    cfg.claw_path = os.path.join(cfg.reference_path, cfg.claw_dir)
+    cfg.mask_dir = cfg.directory_structure.mask_dir
+    cfg.mask_path = os.path.join(cfg.reference_path, cfg.mask_dir)
     
     del cfg.directory_structure
     # in the future, add some logic to handle defaults, etc. 
