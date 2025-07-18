@@ -106,7 +106,7 @@ def jhat_step(cal_file, filtname=None):
     logger.info(f'Output directory:{os.path.dirname(align_batch.t.loc[ixs_todo[0],"outfilename"])}')
     try:
         align_batch.align_wcs(ixs_todo,
-                            overwrite = config.stage3.jhat_step.overwrite,
+                            overwrite = True,
                             outrootdir= outrootdir,
                             outsubdir = outsubdir,
                             addfilter2outsubdir = False,
@@ -390,71 +390,157 @@ def skymatch_step(jhat_files, filtname):
 
 
 # max_radius = 20
-def outlier_step_prep(jhat_files):
-    '''Identifies groups of visits that overlap on the sky, and should be used 
-       in conjunction for outlier detection'''
+def outlier_step_prep(visit, jhat_files, jhat_sregions, filtname):
+    '''
+        Identifies groups of visits that overlap on the sky, and should be used 
+        in conjunction for outlier detection
+
+        Returns list of asn files that we need to run outlier detection on
+
+    '''
 
     from jwst.associations.lib.rules_level3_base import DMS_Level3_Base
     from jwst.associations import asn_from_list
-    
+    from jwst.associations import load_asn
+
     max_radius = config.stage3.outlier_step.max_radius
-    overwrite = config.stage3.outlier_step.overwrite
 
-    visit_list = [] # list of all unique visit/sca (sensor chip assembly) combinations
+    # visit_list = [] # list of all unique visit/sca (sensor chip assembly) combinations
 
-    for jhat_file in jhat_files:
-        visit = os.path.basename(jhat_file).split('_')[0]
-        if visit not in visit_list:
-            visit_list.append(visit)
+    # for jhat_file in jhat_files:
+    #     visit = os.path.basename(jhat_file).split('_')[0]
+    #     if visit not in visit_list:
+    #         visit_list.append(visit)
 
-
-    for i,visit in enumerate(visit_list):
+    # final_asnfile_list = []
         
         # list of files that correspond to this visit
-        visit_imgfile_list = [f for f in jhat_files if visit in f]
-        base_dir = os.path.dirname(visit_imgfile_list[0])
-        asn_file = os.path.join(base_dir, f'outlier_detection_{visit}_asn.json')
+    visit_imgfile_list = [f for f in jhat_files if visit in f]
+    visit_sregion_list = [s for s,f in zip(jhat_sregions,jhat_files) if visit in f]
+    base_dir = os.path.dirname(visit_imgfile_list[0])
+    asn_file = os.path.join(base_dir, f'outlier_detection_{visit}_asn.json')
 
-        if os.path.exists(asn_file) and not overwrite:
-            logger.info(f'Outlier asn file {os.path.basename(asn_file)} already exists, skipping generation')
-            continue
 
-        logger.info(f'Generating outlier asn file {os.path.basename(asn_file)} ({i+1}/{len(visit_list)})...')
+    logger.info(f'Generating outlier asn file {os.path.basename(asn_file)}...')
 
-        # additional files to include, might not be the same visit, but overlap on-sky
-        addnl_visit_imgfile_list = [] 
+    # Find additional files to include
+    # these may not be in the same visit, but have some overlap on-sky
+    addnl_visit_imgfile_list = [] 
 
-        ra = []
-        dec =  []
-        for file in tqdm.tqdm(visit_imgfile_list):
-            s_region = fits.getheader(file, extname='SCI')['S_REGION']
-            ra += [float(s) for s in s_region.split()[2::2]]
-            dec += [float(s) for s in s_region.split()[3::2]]
+    # Algorithm to find overlapping visits (different from Max's code)
+    # > Comparing visit A (already included) and visit B (checking whether to include)
+    # > If any corner of A is contained within visit B, 
+    # > or any corner of visit B is contained within visit A, 
+    # > then visit B gets included
 
-        coords  = SkyCoord(ra=ra, dec=dec, unit='deg')  
-        
+    from matplotlib.path import Path
+    for visit_A, region_A in zip(visit_imgfile_list, visit_sregion_list):
+        # compute corner coordinates for visit A
+        ra = [float(s) for s in region_A.split()[2::2]]
+        dec = [float(s) for s in region_A.split()[3::2]]
+        polygon_A = Path(np.array([ra, dec]).T, closed=True)
 
-        for new_file in tqdm.tqdm(jhat_files):
-            if new_file not in visit_imgfile_list:
-                s_region = fits.getheader(new_file, extname='SCI')['S_REGION']
-                ra_new = [float(s) for s in s_region.split()[2::2]]
-                dec_new = [float(s) for s in s_region.split()[3::2]]
-
-                coords_new  = SkyCoord(ra=ra_new, dec=dec_new, unit='deg')  
+        for visit_B, region_B in zip(jhat_files, jhat_sregions):
+            if visit_B in visit_imgfile_list:
+                continue
+            
+            # compute corner coordinates for visit B
+            ra = [float(s) for s in region_B.split()[2::2]]
+            dec = [float(s) for s in region_B.split()[3::2]]
+            polygon_B = Path(np.array([ra, dec]).T, closed=True)
                     
-                idx_1, idx_2, d2d, d3d  = coords_new.search_around_sky(coords, max_radius * u.arcsec)
-                if np.size(idx_1)>0:
-                    addnl_visit_imgfile_list.append(new_file)
-    
-        visit_imgfile_list += addnl_visit_imgfile_list
+            overlap = False
+            for p in polygon_A.vertices:
+                if overlap:
+                    break
+                    
+                if polygon_B.contains_point(p):
+                    overlap = True
 
-        asn = asn_from_list.asn_from_list(visit_imgfile_list, rule=DMS_Level3_Base, product_name='outlier_files')
+            for p in polygon_B.vertices:
+                if overlap:
+                    break
+
+                if polygon_A.contains_point(p):
+                    overlap = True
+
+            if overlap:
+                addnl_visit_imgfile_list.append(visit_B)
+
+
+
+    visit_imgfile_list += addnl_visit_imgfile_list
+
+
+
+    # addnl_sregion_list = [s for s,f in zip(jhat_sregions,jhat_files) if f in addnl_visit_imgfile_list]
+    # import matplotlib.pyplot as plt
+    # import matplotlib as mpl
+    # fig, ax = plt.subplots()
+    # for reg in addnl_sregion_list:
+    #     ra = [float(s) for s in reg.split()[2::2]]
+    #     dec = [float(s) for s in reg.split()[3::2]]
+    #     p = mpl.patches.Polygon(np.array([ra,dec]).T, closed=True, facecolor='b', alpha=0.1, edgecolor='none')
+    #     ax.add_patch(p)
+    #     ax.scatter(ra, dec, marker='.')
+    # for reg in visit_sregion_list:
+    #     ra = [float(s) for s in reg.split()[2::2]]
+    #     dec = [float(s) for s in reg.split()[3::2]]
+    #     p = mpl.patches.Polygon(np.array([ra,dec]).T, closed=True, facecolor='r', alpha=0.3, edgecolor='none')
+    #     ax.add_patch(p)
+    #     p = mpl.patches.Polygon(np.array([ra,dec]).T, closed=True, facecolor='none', alpha=1, edgecolor='r')
+    #     ax.add_patch(p)
+    #     ax.scatter(ra, dec, marker='.')
+    # ax.set_aspect('equal')
+    # plt.savefig('/n23data2/hakins/jwst/scripts/test.pdf')
+    # plt.close()
+
+
+
+
+    asn = asn_from_list.asn_from_list(visit_imgfile_list, rule=DMS_Level3_Base, product_name='outlier_files')
         
-        with open(asn_file, 'w') as outfile:
-            name, serialized = asn.dump(format='json')
-            outfile.write(serialized)
+    # Handle existing asn files and *crf files. 
+    if os.path.exists(asn_file):
+        # visit_path = os.path.join(config.stage3_product_path,filtname,visit)
+        # outlier_path = os.path.join(config.stage3_product_path,filtname,visit,'outliers')
 
+        jf = glob.glob(os.path.join(config.stage3_product_path, filtname, f'{visit}*_jhat.fits'))
+        cf = glob.glob(os.path.join(config.stage3_product_path, filtname, f'{visit}*_crf.fits'))
+        all_crf_files_exist = len(jf)==len(cf) 
+        # if (len(jf) == len(cf)) and not config.stage3.outlier_step.overwrite:
+            # all_crf_files_exist = True
+            # logger.info(f'All .crf files for visit {visit} already exist, skipping...')
 
+        with open(asn_file) as fp:
+            asn_old = load_asn(fp)
+        old_visit_imgfile_list = sorted([d['expname'] for d in asn_old['products'][0]['members']])
+        visit_imgfile_list = sorted(visit_imgfile_list)
+        asn_file_unchanged = visit_imgfile_list==old_visit_imgfile_list
+
+        overwrite = config.stage3.outlier_step.overwrite
+        if all_crf_files_exist and asn_file_unchanged and not overwrite:
+            logger.info(f'Skipping outlier detection for visit {visit}; all *.crf files exist, and asn file is unchanged from previous')
+            return None
+        
+        elif overwrite:
+            logger.info(f'Will overwrite *.crf files for visit {visit}; overwrite=True')
+
+        elif all_crf_files_exist:
+            logger.info(f'Will overwrite *.crf files for visit {visit}; asn file has changed.')
+        
+        elif asn_file_unchanged:
+            logger.info(f'Will overwrite *.crf files for visit {visit}; asn file unchanged, but missing crf files.')
+    
+    else:
+        logger.info(f"Outlier step for visit {visit} will be run for the first time")
+
+    # If we're running outlier_step for the first time, or the imgfile list has changed, export the asn file and add it to the list of asn files returned
+    with open(asn_file, 'w') as outfile:
+        name, serialized = asn.dump(format='json')
+        outfile.write(serialized)
+
+    return asn_file
 
 
 def outlier_step(asn_file, filtname):
@@ -469,11 +555,13 @@ def outlier_step(asn_file, filtname):
     if not os.path.exists(outlier_path):
         os.mkdir(outlier_path)
 
-    jhat_files = glob.glob(os.path.join(config.stage3_product_path,filtname,f'{visit}*_jhat.fits'))
-    crf_files = glob.glob(os.path.join(config.stage3_product_path,filtname,f'{visit}*_crf.fits'))
-    if (len(jhat_files) == len(crf_files)) and not config.stage3.outlier_step.overwrite:
-        logger.info(f'All .crf files for visit {visit} already exist, skipping...')
-        return
+    # jhat_files = glob.glob(os.path.join(config.stage3_product_path,filtname,f'{visit}*_jhat.fits'))
+    # crf_files = glob.glob(os.path.join(config.stage3_product_path,filtname,f'{visit}*_crf.fits'))
+    # if (len(jhat_files) == len(crf_files)) and not config.stage3.outlier_step.overwrite:
+    #     logger.info(f'All .crf files for visit {visit} already exist, skipping...')
+    #     if os.path.exists(visit_path):
+    #         shutil.rmtree(visit_path)
+    #     return
     
     params = {'assign_mtwcs':      {'skip': True},
               'tweakreg':          {'skip': True},
@@ -501,6 +589,11 @@ def outlier_step(asn_file, filtname):
         output_file = os.path.join(config.stage3_product_path, filtname, os.path.basename(input_file))
         shutil.move(input_file, output_file)
 
+    # Remove the visit subdirectory (these take up lots of space, 
+    # and we only care about the crf files which we've already 
+    # moved up to the main directory)
+    if os.path.exists(visit_path):
+        shutil.rmtree(visit_path)
 
 
 
@@ -511,8 +604,8 @@ def resample_step(filtname):
     from jwst.associations.lib.rules_level3_base import DMS_Level3_Base
     from jwst.associations import asn_from_list
 
-    
-    imgfile_list = utils.get_crf_files(filtname)
+    imgfile_list = utils.get_crf_files(filtname, skip=config.stage3.files_to_skip)
+    # TODO implement logic to ensure that no file in imgfile_list matches config.stage3.files_to_skip
 
     pixel_scale = config.stage3.resample_step.pixel_scale
     if isinstance(pixel_scale, str):
@@ -529,153 +622,169 @@ def resample_step(filtname):
 
     mode = config.stage3.resample_step.mode # `tile` or `indiv`
     if mode == 'tile':
-        tile = config.stage3.resample_step.tile
+
         version = config.stage3.resample_step.version
-        logger.info(f'Running resample_step for tile {tile}, {filtname}, {pixel_scale_str}')
+        tiles = config.stage3.resample_step.tile
+        if isinstance(tiles, str):
+            tiles = [tiles]
 
-        mosaic_name = config.stage3.resample_step.mosaic_name
-        mosaic_name = mosaic_name.replace('[filter]', filtname)
-        mosaic_name = mosaic_name.replace('[field_name]', config.field_name)
-        mosaic_name = mosaic_name.replace('[pixel_scale]', pixel_scale_str)
-        mosaic_name = mosaic_name.replace('[version]', version)
-        mosaic_name = mosaic_name.replace('[tile]', tile)
-        mosaic_outdir = os.path.join(config.mosaic_path, filtname)
-        logger.info(f'Output will go to {mosaic_outdir}/{mosaic_name}_i2d.fits')
+        for tile in tiles:
+            logger.info(f'Running resample_step for tile {tile}, {filtname}, {pixel_scale_str}')
 
-        ### select the files that overlap the tile we want to drizzle
-        from .ref import tile_corners
-        tile_polygon = Polygon(tile_corners[tile])
+            mosaic_name = config.stage3.resample_step.mosaic_name
+            mosaic_name = mosaic_name.replace('[filter]', filtname)
+            mosaic_name = mosaic_name.replace('[field_name]', config.field_name)
+            mosaic_name = mosaic_name.replace('[pixel_scale]', pixel_scale_str)
+            mosaic_name = mosaic_name.replace('[version]', version)
+            mosaic_name = mosaic_name.replace('[tile]', tile)
+            mosaic_outdir = os.path.join(config.mosaic_path, filtname)
+            mosaic_file = os.path.join(mosaic_outdir, f'{mosaic_name}_i2d.fits')
         
-        selected_files = []
-        for file in imgfile_list:
-            coords_rect = np.zeros((4,2))
-            hdulist = fits.open(file, ignore_missing_simple=True)
-            wcs = WCS(hdulist[1].header, naxis=2)
-            pixcoords = np.array([[0., 0.], [2048., 0.], [2048., 2048.], [0., 2048.]])
-            worldcoords = wcs.wcs_pix2world(pixcoords, 0)
-            aa = 0
-            for coords in worldcoords:
-                coords_rect[aa,0] = coords[0]
-                coords_rect[aa,1] = coords[1]
-                aa += 1
+            logger.info(f'Output will go to {mosaic_file}')
 
-            file_polygon = Polygon(coords_rect)
+            if not os.path.exists(mosaic_file):
+                ### select the files that overlap the tile we want to drizzle
+                from .utils import get_tile_corners
+                tile_polygon = Polygon(get_tile_corners(tile, field=config.field_name))
 
-            if tile_polygon.intersects(file_polygon):
-                selected_files.append(file)
-                        
-        logger.info(f'Preparing to drizzle+combine {len(selected_files)} images')
+                selected_files = []
+                for file in imgfile_list:
+                    coords_rect = np.zeros((4,2))
+                    hdulist = fits.open(file, ignore_missing_simple=True)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore')
+                        wcs = WCS(hdulist[1].header, naxis=2)
+                    pixcoords = np.array([[0., 0.], [2048., 0.], [2048., 2048.], [0., 2048.]])
+                    worldcoords = wcs.wcs_pix2world(pixcoords, 0)
+                    aa = 0
+                    for coords in worldcoords:
+                        coords_rect[aa,0] = coords[0]
+                        coords_rect[aa,1] = coords[1]
+                        aa += 1
 
-        asn_file = os.path.join(config.stage3_product_path,filtname,f'{mosaic_name}_asn.json')
-        asn = asn_from_list.asn_from_list(selected_files, rule=DMS_Level3_Base, product_name=mosaic_name)
-        with open(asn_file, 'w') as outfile:
-            name, serialized = asn.dump(format='json')
-            outfile.write(serialized)
-        
-        from .ref import cosmos_tangent_point
-        if pixel_scale_str == '30mas':
-            from .ref import tile_crpix_30mas
-            crpix_0, crpix_1 = tile_crpix_30mas[tile]
-            from .ref import tile_output_shape_30mas as output_shape
-        elif pixel_scale_str == '60mas':
-            from .ref import tile_crpix_60mas
-            crpix_0, crpix_1 = tile_crpix_60mas[tile]
-            from .ref import tile_output_shape_60mas as output_shape
-        
-        params = {'assign_mtwcs':      {'skip': True},
-                  'tweakreg':          {'skip': True},
-                  'skymatch':          {'skip': True},
-                  'outlier_detection': {'skip': True},
-                  'resample':          {'pixfrac'      : config.stage3.resample_step.pixfrac,
-                                        'kernel'       : config.stage3.resample_step.kernel,
-                                        'pixel_scale'  : pixel_scale,
-                                        'rotation'     : 20,
-                                        'output_shape' : output_shape,
-                                        'crpix'        : [crpix_0,crpix_1],
-                                        'crval'        : [cosmos_tangent_point[0],cosmos_tangent_point[1]],
-                                        'fillval'      :'indef',
-                                        'weight_type'  :'ivm',
-                                        'single'       : False,
-                                        'blendheaders' : True,
-                                        'save_results' : True},
-                  'source_catalog':    {'skip': True}}
-        
-        from jwst.pipeline import calwebb_image3
-        output = calwebb_image3.Image3Pipeline.call(asn_file, 
-            output_dir = mosaic_outdir, 
-            steps = params, 
-            save_results = True)
-        
+                    file_polygon = Polygon(coords_rect)
+
+                    if tile_polygon.intersects(file_polygon):
+                        selected_files.append(file)
+                                
+                logger.info(f'Preparing to drizzle+combine {len(selected_files)} images')
+                if len(selected_files) == 0:
+                    return
+
+                asn_file = os.path.join(config.stage3_product_path,filtname,f'{mosaic_name}_asn.json')
+                asn = asn_from_list.asn_from_list(selected_files, rule=DMS_Level3_Base, product_name=mosaic_name)
+                with open(asn_file, 'w') as outfile:
+                    name, serialized = asn.dump(format='json')
+                    outfile.write(serialized)
+                
+                from .utils import get_tile_wcs
+                crpix, crval, shape, rotation = get_tile_wcs(tile, ps=pixel_scale_str, field=config.field_name)
+                # from .ref import cosmos_tangent_point
+                # if pixel_scale_str == '30mas':
+                #     from .ref import tile_crpix_30mas
+                #     crpix_0, crpix_1 = tile_crpix_30mas[tile]
+                #     from .ref import tile_output_shape_30mas as output_shape
+                # elif pixel_scale_str == '60mas':
+                #     from .ref import tile_crpix_60mas
+                #     crpix_0, crpix_1 = tile_crpix_60mas[tile]
+                #     from .ref import tile_output_shape_60mas as output_shape
+                
+                params = {'assign_mtwcs':    {'skip': True},
+                        'tweakreg':          {'skip': True},
+                        'skymatch':          {'skip': True},
+                        'outlier_detection': {'skip': True},
+                        'resample':          {'pixfrac'      : config.stage3.resample_step.pixfrac,
+                                              'kernel'       : config.stage3.resample_step.kernel,
+                                              'pixel_scale'  : pixel_scale,
+                                              'rotation'     : rotation,
+                                              'output_shape' : shape,
+                                              'crpix'        : crpix,
+                                              'crval'        : crval,
+                                              'fillval'      :'indef',
+                                              'weight_type'  :'ivm',
+                                              'single'       : False,
+                                              'blendheaders' : True,
+                                              'save_results' : True},
+                        'source_catalog':    {'skip': True}}
+                
+                from jwst.pipeline import calwebb_image3
+                output = calwebb_image3.Image3Pipeline.call(asn_file, 
+                    output_dir = mosaic_outdir, 
+                    steps = params, 
+                    save_results = True)
+            else:
+                logger.info(f'Skipping resample_step for {os.path.basename(mosaic_file)}')
+                
+            if config.stage3.resample_step.background_subtract:
+                from .bkgsub import SubtractBackground
+
+                if not os.path.exists(mosaic_file.replace('_i2d.fits', '_i2d_before_bkgsub.fits')):
+
+                    bkg = SubtractBackground(
+                        ring_radius_in = config.stage3.resample_step.ring_radius_in,
+                        ring_width = config.stage3.resample_step.ring_width,
+                        ring_clip_max_sigma = config.stage3.resample_step.ring_clip_max_sigma,
+                        ring_clip_box_size = config.stage3.resample_step.ring_clip_box_size,
+                        ring_clip_filter_size = config.stage3.resample_step.ring_clip_filter_size,
+                        tier_kernel_size = config.stage3.resample_step.tier_kernel_size,
+                        tier_npixels = config.stage3.resample_step.tier_npixels,
+                        tier_nsigma = config.stage3.resample_step.tier_nsigma,
+                        tier_dilate_size = config.stage3.resample_step.tier_dilate_size,
+                        bg_box_size = config.stage3.resample_step.bg_box_size,
+                        bg_filter_size = config.stage3.resample_step.bg_filter_size,
+                        bg_exclude_percentile = config.stage3.resample_step.bg_exclude_percentile,
+                        bg_sigma = config.stage3.resample_step.bg_sigma,
+                        bg_interpolator = config.stage3.resample_step.bg_interpolator,
+                        suffix = 'bkgsub',
+                        replace_sci = True,
+                    )
+
+                    bkg.call(mosaic_file)
+
+                    mosaic_file_orig = mosaic_file.replace('_i2d.fits', '_i2d_before_bkgsub.fits')
+                    logger.info(f"Copying input to {os.path.basename(mosaic_file_orig)}")
+                    shutil.copy2(mosaic_file, mosaic_file_orig)
+
+                    logger.info(f"Renaming {os.path.basename(bkg.outfile)} to {os.path.basename(mosaic_file)}")
+                    shutil.move(bkg.outfile, mosaic_file)
+                else:
+                    logger.info(f'Skipping background subtraction for {os.path.basename(mosaic_file)}')
+            
+            if config.stage3.resample_step.split_extensions:
+                logger.info('Splitting extensions')
+                
+                sci = fits.getdata(mosaic_file, extname='SCI')
+                hdr = fits.getheader(mosaic_file, extname='SCI')
+                err = fits.getdata(mosaic_file, extname='ERR')
+                wht = fits.getdata(mosaic_file, extname='WHT')
+
+                ext_outdir = os.path.join(mosaic_outdir, 'extensions')
+                if not os.path.exists(ext_outdir):
+                    os.mkdir(ext_outdir)
+
+
+                hdu = fits.PrimaryHDU(data=sci, header=hdr)
+                hdu.writeto(os.path.join(ext_outdir, os.path.basename(mosaic_file).replace('_i2d.fits','_sci.fits')), overwrite=True)
+                
+                hdr.update({'EXTNAME':'ERR'})
+                hdu = fits.PrimaryHDU(data=err, header=hdr)
+                hdu.writeto(os.path.join(ext_outdir, os.path.basename(mosaic_file).replace('_i2d.fits','_err.fits')), overwrite=True)
+                
+                hdr.update({'EXTNAME':'WHT'})
+                hdu = fits.PrimaryHDU(data=wht, header=hdr)
+                hdu.writeto(os.path.join(ext_outdir, os.path.basename(mosaic_file).replace('_i2d.fits','_wht.fits')), overwrite=True)
+
+                has_srcmask = True
+                try:
+                    srcmask = fits.getdata(mosaic_file, extname='SRCMASK')
+                except:
+                    logger.info(f'{mosaic_name} has no extension SRCMASK')
+                    has_srcmask = False
+                
+                if has_srcmask:
+                    hdr.update({'EXTNAME':'SRCMASK'})
+                    hdu = fits.PrimaryHDU(data=srcmask, header=hdr)
+                    hdu.writeto(os.path.join(ext_outdir, os.path.basename(mosaic_file).replace('_i2d.fits','_srcmask.fits')), overwrite=True)
+
     else:
         raise Exception('only mode=tile supported atm')
-
-    if config.stage3.resample_step.background_subtract:
-        from .bkgsub import SubtractBackground
-        
-        mosaic_file = os.path.join(mosaic_outdir, f'{mosaic_name}_i2d.fits')
-
-        bkg = SubtractBackground(
-            ring_radius_in = config.stage3.resample_step.ring_radius_in,
-            ring_width = config.stage3.resample_step.ring_width,
-            ring_clip_max_sigma = config.stage3.resample_step.ring_clip_max_sigma,
-            ring_clip_box_size = config.stage3.resample_step.ring_clip_box_size,
-            ring_clip_filter_size = config.stage3.resample_step.ring_clip_filter_size,
-            tier_kernel_size = config.stage3.resample_step.tier_kernel_size,
-            tier_npixels = config.stage3.resample_step.tier_npixels,
-            tier_nsigma = config.stage3.resample_step.tier_nsigma,
-            tier_dilate_size = config.stage3.resample_step.tier_dilate_size,
-            bg_box_size = config.stage3.resample_step.bg_box_size,
-            bg_filter_size = config.stage3.resample_step.bg_filter_size,
-            bg_exclude_percentile = config.stage2.bkgsub_var_step.bg_exclude_percentile,
-            bg_sigma = config.stage3.resample_step.bg_sigma,
-            bg_interpolator = config.stage3.resample_step.bg_interpolator,
-            suffix = 'bkgsub',
-            replace_sci = True,
-        )
-
-        bkg.call(mosaic_file)
-
-        mosaic_file_orig = mosaic_file.replace('_i2d.fits', '_i2d_before_bkgsub.fits')
-        logger.info(f"Copying input to {os.path.basename(mosaic_file_orig)}")
-        shutil.copy2(mosaic_file, mosaic_file_orig)
-
-        logger.info(f"Renaming {os.path.basename(bkg.outfile)} to {os.path.basename(mosaic_file)}")
-        shutil.move(bkg.outfile, mosaic_file)
-    
-    if config.stage3.resample_step.split_extensions:
-        logger.info('Splitting extensions')
-        
-        mosaic_file = os.path.join(mosaic_outdir, f'{mosaic_name}_i2d.fits')
-        
-        sci = fits.getdata(mosaic_file, extname='SCI')
-        hdr = fits.getheader(mosaic_file, extname='SCI')
-        err = fits.getdata(mosaic_file, extname='ERR')
-        wht = fits.getdata(mosaic_file, extname='WHT')
-
-        ext_outdir = os.path.join(mosaic_outdir, 'extensions')
-        if not os.path.exists(ext_outdir):
-            os.mkdir(ext_outdir)
-
-
-        hdu = fits.PrimaryHDU(data=sci, header=hdr)
-        hdu.writeto(os.path.join(ext_outdir, os.path.basename(mosaic_file).replace('_i2d.fits','_sci.fits')))
-        
-        hdr.update({'EXTNAME':'ERR'})
-        hdu = fits.PrimaryHDU(data=err, header=hdr)
-        hdu.writeto(os.path.join(ext_outdir, os.path.basename(mosaic_file).replace('_i2d.fits','_err.fits')))
-        
-        hdr.update({'EXTNAME':'WHT'})
-        hdu = fits.PrimaryHDU(data=wht, header=hdr)
-        hdu.writeto(os.path.join(ext_outdir, os.path.basename(mosaic_file).replace('_i2d.fits','_wht.fits')))
-
-        has_srcmask = True
-        try:
-            srcmask = fits.getdata(mosaic_file, extname='SRCMASK')
-        except:
-            logger.info(f'{mosaic_name} has no extension SRCMASK')
-            has_srcmask = False
-        
-        if has_srcmask:
-            hdr.update({'EXTNAME':'SRCMASK'})
-            hdu = fits.PrimaryHDU(data=srcmask, header=hdr)
-            hdu.writeto(os.path.join(ext_outdir, os.path.basename(mosaic_file).replace('_i2d.fits','_srcmask.fits')))

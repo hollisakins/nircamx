@@ -2,10 +2,17 @@ from . import utils
 import os, glob
 import shutil
 from copy import deepcopy
-from .ref import NIR_amps
 import numpy as np
 from datetime import datetime
 from time import sleep
+
+NIR_amps = {
+    # taking the reference rows/columns into account
+    'A': {'data': [4, 2044, 4,    512 ]},
+    'B': {'data': [4, 2044, 512,  1024]},
+    'C': {'data': [4, 2044, 1024, 1536]},
+    'D': {'data': [4, 2044, 1536, 2044]},
+}
 
 # Individual steps that make up calwebb_detector1
 from scipy.ndimage import median_filter, binary_dilation, gaussian_filter
@@ -231,14 +238,29 @@ def run_snowblind(rate_file):
 
      
 def remove_snowballs(image):
-    logger.info(f'Running remove_snowballs on {os.path.basename(image)[:-10]}')
+
+    # check that image has not already been corrected
     from jwst.datamodels import ImageModel
+    model = ImageModel(image)
+    for entry in model.history:
+        if 'Removed snowballs' in entry['description']:
+            logger.info(f'{os.path.basename(image)} already removed snowballs, exiting')
+            return
+
+    logger.info(f'Running remove_snowballs on {os.path.basename(image)}')
     import snowblind
 
-    with ImageModel(image) as immodel:
-        snowblind_dq = run_snowblind(image)
-        immodel.dq |= snowblind_dq
-        immodel.save(image)
+    snowblind_dq = run_snowblind(image)
+    model.dq |= snowblind_dq
+    
+    # add history entry
+    from stdatamodels import util as stutil
+    time = datetime.now()
+    stepdescription = f"Removed snowballs {time.strftime('%Y-%m-%d %H:%M:%S')}"
+    substr = stutil.create_history_entry(stepdescription)
+    model.history.append(substr)
+
+    model.save(image)
 
 
 def calc_variance(data, template, coeff):
@@ -270,6 +292,7 @@ def calc_variance(data, template, coeff):
 def remove_wisps(rate_file):
     plot = config.stage1.remove_wisp_step.plot
     apply_flat = config.stage1.remove_wisp_step.apply_flat
+    use_custom_flat = config.stage1.remove_wisp_step.use_custom_flat
 
     try:
         crds_context = os.environ['CRDS_CONTEXT']
@@ -301,22 +324,35 @@ def remove_wisps(rate_file):
 
     if apply_flat:
         logger.info('Applying flat to match wisp templates')
-        import crds
-        # pull flat from CRDS using the current context
+        
         crds_dict = {'INSTRUME':'NIRCAM',
-                     'DETECTOR':model.meta.instrument.detector,
-                     'FILTER':model.meta.instrument.filter,
-                     'PUPIL':model.meta.instrument.pupil,
-                     'DATE-OBS':model.meta.observation.date,
-                     'TIME-OBS':model.meta.observation.time}
-        flats = crds.getreferences(crds_dict, reftypes=['flat'], context=crds_context)
-        # if the CRDS loopup fails, should return a CrdsLookupError, but 
-        # just in case:
-        try:
-            flatfile = flats['flat']
-        except KeyError:
-            logger.error(f'Flat was not found in CRDS with the parameters: {crds_dict}')
-            sys.exit()
+                    'DETECTOR':model.meta.instrument.detector,
+                    'FILTER':model.meta.instrument.filter,
+                    'PUPIL':model.meta.instrument.pupil,
+                    'DATE-OBS':model.meta.observation.date,
+                    'TIME-OBS':model.meta.observation.time}
+
+        if use_custom_flat:
+            fn = crds_dict['FILTER'].upper()
+            det = crds_dict['DETECTOR'].upper()
+            flatfile = os.path.join(config.flats_path, f'flat_nircam_{fn}_{det}_CLEAR.fits')
+            if not os.path.exists(flatfile):
+                logger.warning(f'Flat file {os.path.basename(flatfile)} was not found in {config.flats_path}')
+                logger.warning(f'Falling back to CRDS flats')
+                use_custom_flat = False
+        
+
+        if not use_custom_flat:
+            import crds
+            # pull flat from CRDS using the current context
+            flats = crds.getreferences(crds_dict, reftypes=['flat'], context=crds_context)
+            # if the CRDS loopup fails, should return a CrdsLookupError, but 
+            # just in case:
+            try:
+                flatfile = flats['flat']
+            except KeyError:
+                logger.error(f'Flat was not found in CRDS with the parameters: {crds_dict}')
+                sys.exit()
 
         logger.info(f'Using flat: {os.path.basename(flatfile)}')
         from jwst.datamodels import FlatModel
@@ -339,7 +375,11 @@ def remove_wisps(rate_file):
     # source detection
     threshold = detect_threshold(model.data, nsigma=5.5)
     segm = detect_sources(model.data, threshold, npixels=55)
-    wobj = np.where(segm.data > 0)
+    try:
+        wobj = np.where(segm.data > 0)
+    except:
+        print('!!!', rate_file)
+        raise 
     mask[wobj] = True
 
     masked_im = model.data.copy()
@@ -581,12 +621,11 @@ def fit_sky(data):
 
 def fit_sky_tot(data):
     """Fit distribution of sky fluxes with a Gaussian. Returns simple mean of Gaussian distribution."""
-    std = sigma_clipped_stats(data)[2]
-    bins = np.linspace(-10*std, 10*std, 1000)
+    mean, median, std = sigma_clipped_stats(data)
+    bins = np.linspace(median-10*std, median+10*std, 1000)
     h, b = np.histogram(data, bins=bins)
     h = h / np.max(h)
     bc = 0.5 * (b[1:] + b[:-1])
-    binsize = b[1] - b[0]
 
     p0 = [1, bc[np.argmax(h)], std]
     popt,pcov = curve_fit(utils.Gaussian, bc, h, p0=p0)
@@ -870,6 +909,7 @@ def remove_striping(image):
     """
     
     apply_flat = config.stage1.remove_striping_step.apply_flat
+    use_custom_flat = config.stage1.remove_striping_step.use_custom_flat
     mask_sources = config.stage1.remove_striping_step.mask_sources
     maskparam=config.stage1.remove_striping_step.maskparam
     subtract_background=config.stage1.remove_striping_step.subtract_background
@@ -897,22 +937,34 @@ def remove_striping(image):
     # apply the flat to get a cleaner meausurement of the striping
     if apply_flat:
         logger.info('Applying flat for cleaner measurement of striping patterns')
-        import crds
-        # pull flat from CRDS using the current context
+
         crds_dict = {'INSTRUME':'NIRCAM', 
-                     'DETECTOR':model.meta.instrument.detector, 
-                     'FILTER':model.meta.instrument.filter, 
-                     'PUPIL':model.meta.instrument.pupil, 
-                     'DATE-OBS':model.meta.observation.date,
-                     'TIME-OBS':model.meta.observation.time}
-        flats = crds.getreferences(crds_dict, reftypes=['flat'], context=crds_context)
-        # if the CRDS loopup fails, should return a CrdsLookupError, but
-        # just in case:
-        try:
-            flatfile = flats['flat']
-        except KeyError:
-            logger.error(f'Flat was not found in CRDS with the parameters: {crds_dict}')
-            exit()
+                    'DETECTOR':model.meta.instrument.detector, 
+                    'FILTER':model.meta.instrument.filter, 
+                    'PUPIL':model.meta.instrument.pupil, 
+                    'DATE-OBS':model.meta.observation.date,
+                    'TIME-OBS':model.meta.observation.time}
+
+        if use_custom_flat:
+            fn = crds_dict['FILTER'].upper()
+            det = crds_dict['DETECTOR'].upper()
+            flatfile = os.path.join(config.flats_path, f'flat_nircam_{fn}_{det}_CLEAR.fits')
+            if not os.path.exists(flatfile):
+                logger.warning(f'Flat file {os.path.basename(flatfile)} was not found in {config.flats_path}')
+                logger.warning(f'Falling back to CRDS flats')
+                use_custom_flat = False
+        
+        if not use_custom_flat:
+            import crds
+            # pull flat from CRDS using the current context
+            flats = crds.getreferences(crds_dict, reftypes=['flat'], context=crds_context)
+            # if the CRDS loopup fails, should return a CrdsLookupError, but
+            # just in case:
+            try:
+                flatfile = flats['flat']
+            except KeyError:
+                logger.error(f'Flat was not found in CRDS with the parameters: {crds_dict}')
+                sys.exit()
 
         logger.info(f'Using flat: {os.path.basename(flatfile)}')
         from jwst.flatfield.flat_field import do_correction
@@ -922,10 +974,16 @@ def remove_striping(image):
                 # use the JWST Calibration Pipeline flat fielding Step
                 model, applied_flat = do_correction(model, flat)
         except:
-            sleep(3)
-            with FlatModel(flatfile) as flat:
-                # use the JWST Calibration Pipeline flat fielding Step
-                model, applied_flat = do_correction(model, flat)
+            sleep(5)
+            try:
+                with FlatModel(flatfile) as flat:
+                    # use the JWST Calibration Pipeline flat fielding Step
+                    model, applied_flat = do_correction(model, flat)
+            except:
+                sleep(5)
+                with FlatModel(flatfile) as flat:
+                    # use the JWST Calibration Pipeline flat fielding Step
+                    model, applied_flat = do_correction(model, flat)
 
     mask = np.zeros(model.data.shape, dtype=bool)
     mask[model.dq > 0] = True
@@ -984,6 +1042,7 @@ def remove_striping(image):
             maskparam = find_optimal_threshold(model, mask, full_horizontal, maxiters)
         except:
             logger.error(f'find_optimal_threshold failed on {image}')
+            raise
 
         logger.info(f'Using threshold: {maskparam:.2f}')
 
@@ -1027,15 +1086,16 @@ def remove_striping(image):
     vertical_striping[:,:] = vstriping
 
     # save fits
-    fits.writeto(image.replace('.fits', '_horiz.fits'), horizontal_striping, overwrite=True)
-    fits.writeto(image.replace('.fits', '_vert.fits'), vertical_striping, overwrite=True)
+    # fits.writeto(image.replace('.fits', '_horiz.fits'), horizontal_striping, overwrite=True)
+    # fits.writeto(image.replace('.fits', '_vert.fits'), vertical_striping, overwrite=True)
 
     model.close()
     
     # copy image 
     image_orig = image.replace('.fits', '_orig.fits')
-    logger.info(f"Copying input to {image_orig}")
-    shutil.copy2(image, image_orig)
+    if config.stage1.remove_striping_step.plot:
+        logger.info(f"Copying input to {image_orig}")
+        shutil.copy2(image, image_orig)
 
     # remove striping from science image
     with ImageModel(image) as immodel:
@@ -1085,13 +1145,13 @@ def remove_striping(image):
 
 
 
-
 def persistence_step(rate_files):
     from jwst.datamodels import ImageModel, ModelContainer
     path = os.path.dirname(rate_files[0])
     images = ModelContainer()
     for rate_file in rate_files:
-        images.append(ImageModel(rate_file))
+        if os.path.exists(rate_file.replace('_rate.fits','_jump.fits')):
+            images.append(ImageModel(rate_file))
 
     import snowblind
     output = snowblind.PersistenceFlagStep.call(images, 
@@ -1099,3 +1159,17 @@ def persistence_step(rate_files):
         suffix = "rate",
         input_dir = path, 
         output_dir = path)
+
+    
+    for rate_file in rate_files:
+        try: os.remove(rate_file.replace('_rate.fits', '_rateints.fits'))
+        except OSError: pass
+        try: os.remove(rate_file.replace('_rate.fits', '_jump.fits'))
+        except OSError: pass
+        try: os.remove(rate_file.replace('_rate.fits', '_trapsfilled.fits'))
+        except OSError: pass
+        try: os.remove(rate_file.replace('_rate.fits', '_persistence.fits'))
+        except OSError: pass
+        try: os.remove(rate_file.replace('_rate.fits', '_output_pers.fits'))
+        except OSError: pass
+        logger.info(f"Removed extra files for {os.path.basename(rate_file).replace('_rate.fits','')}")

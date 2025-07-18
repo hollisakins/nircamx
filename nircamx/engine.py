@@ -1,4 +1,5 @@
 import os
+# os.sched_setaffinity(0,range(48))
 import multiprocess as mp
 from functools import partial
 from . import utils
@@ -56,7 +57,6 @@ def main():
                 with mp.Pool(utils.n_procs) as pool:
                     print(pool.map(remove_snowballs, rate_files))
         
-        # TODO updated wisp templates created by JADES team -- compare to Max's templates in F115W and F150W
         if config.stage1.remove_wisp_step.run:
             from .stage1 import remove_wisps
 
@@ -77,11 +77,12 @@ def main():
                 else:
                     for rate_file in rate_files:
                         remove_striping(rate_file)
-                        
-        if config.stage1.persitence_step.run:
+          
+        if config.stage1.persistence_step.run:
             from .stage1 import persistence_step
             
             for filtname in config.filters:
+                print(filtname)
                 rate_files = utils.get_rate_files(filtname)
                 persistence_step(rate_files)
                 
@@ -92,7 +93,9 @@ def main():
     if config.stage2.run:
         from . import stage2
         stage2.config = config
+        files_to_skip = config.stage2.files_to_skip
 
+        # image2_step
         if config.stage2.image2_step.run:
             from .stage2 import image2_step
 
@@ -105,7 +108,7 @@ def main():
                 os.mkdir(config.stage2_product_path)
 
             for filtname in config.filters:
-                rate_files = utils.get_rate_files(filtname)
+                rate_files = utils.get_rate_files(filtname, skip=files_to_skip)
 
                 # if `products/pipeline_level2/f444w` doesn't exist, make it
                 if not os.path.exists(os.path.join(config.stage2_product_path,filtname)):
@@ -118,35 +121,80 @@ def main():
                 else:
                     for rate_file in rate_files:
                         image2_step(rate_file)
-                    
+        
+        # remove_edge_step
         if config.stage2.remove_edge_step.run:
             from .stage2 import remove_edge
             for filtname in config.filters:
-                cal_files = utils.get_cal_files(filtname)
+                cal_files = utils.get_cal_files(filtname, skip=files_to_skip)
                 with mp.Pool(utils.n_procs) as pool:
                     print(pool.map(remove_edge, cal_files))
 
-
-        
-        # variance_step
-        if config.stage2.bkgsub_var_step.run:
-            from .stage2 import background_subtraction_variance_scaling
+        # skysub_step
+        if config.stage2.skysub_step.run:
+            from .stage2 import sky_subtraction
             for filtname in config.filters: 
-                cal_files = utils.get_cal_files(filtname)
+                cal_files = utils.get_cal_files(filtname, skip=files_to_skip)
 
-                if config.stage2.bkgsub_var_step.pool:
+                if config.stage2.skysub_step.pool:
                     with mp.Pool(utils.n_procs) as pool:
-                        print(pool.map(background_subtraction_variance_scaling, cal_files))
+                        print(pool.map(sky_subtraction, cal_files))
                 else:
                     for cal_file in cal_files:
-                        background_subtraction_variance_scaling(cal_file)
+                        sky_subtraction(cal_file)
 
+
+        if config.stage2.remove_diagonal_striping_step.run:
+            from .stage2 import remove_diagonal_striping
+            for filtname in config.filters:
+                cal_files_all = utils.get_cal_files(filtname, skip=files_to_skip)
+
+                cal_files = utils.get_files(config.stage2.remove_diagonal_striping_step.files, 
+                    path=config.stage2_product_path, filtname=filtname, prefix='', suffix='*_cal.fits')
+
+                cal_files = [r for r in cal_files if r in cal_files_all]
+
+
+                if config.stage2.remove_diagonal_striping_step.pool:
+                    with mp.Pool(utils.n_procs) as pool:
+                        print(pool.map(remove_diagonal_striping, cal_files))
+                else:
+                    for cal_file in cal_files:
+                        remove_diagonal_striping(cal_file)
+
+        # variance_step
+        if config.stage2.variance_step.run:
+            from .stage2 import rescale_variance
+            for filtname in config.filters: 
+                cal_files = utils.get_cal_files(filtname, skip=files_to_skip)
+
+                if config.stage2.variance_step.pool:
+                    with mp.Pool(utils.n_procs) as pool:
+                        print(pool.map(rescale_variance, cal_files))
+                else:
+                    for cal_file in cal_files:
+                        rescale_variance(cal_file)
+
+        # plot_cal_rate
+        if config.stage2.plot_cal_rate.run:
+            from .stage2 import plot_cal_rate
+            for filtname in config.filters: 
+                cal_files = utils.get_cal_files(filtname, skip=files_to_skip)
+
+                if config.stage2.plot_cal_rate.pool:
+                    with mp.Pool(utils.n_procs) as pool:
+                        print(pool.map(plot_cal_rate, cal_files))
+                else:
+                    for cal_file in cal_files:
+                        plot_cal_rate(cal_file)
+
+        # apply_mask_step
         if config.stage2.apply_mask_step.run:
             from .stage2 import apply_masks
 
             for filtname in config.filters:
-                cal_files = utils.get_cal_files(filtname)
-                
+                cal_files = utils.get_cal_files(filtname, skip=files_to_skip)
+
                 with mp.Pool(utils.n_procs) as pool:
                     print(pool.map(apply_masks, cal_files))
 
@@ -154,6 +202,9 @@ def main():
     if config.stage3.run:
         from . import stage3
         stage3.config = config
+        files_to_skip = config.stage3.files_to_skip
+
+        ### TODO check if any jhat_files or crf_files exist already, warn the user if so? 
 
         if not os.path.exists(config.stage3_product_path):
             os.mkdir(config.stage3_product_path)
@@ -164,7 +215,7 @@ def main():
                 if not os.path.exists(os.path.join(config.stage3_product_path, filtname)):
                     os.mkdir(os.path.join(config.stage3_product_path, filtname))
 
-                cal_files = utils.get_cal_files(filtname)
+                cal_files = utils.get_cal_files(filtname, skip=files_to_skip)
                 if config.stage3.jhat_step.pool:
                     file_patterns = [cal_file.replace('_cal.fits', '*_cal.fits') for cal_file in cal_files]
                     with mp.Pool(utils.n_procs) as pool:
@@ -180,7 +231,7 @@ def main():
             for filtname in config.filters:
                 stack_dq_by_detector(filtname) 
 
-                jhat_files = utils.get_jhat_files(filtname)
+                jhat_files = utils.get_jhat_files(filtname, skip=files_to_skip)
                 with mp.Pool(utils.n_procs) as pool:
                     print(pool.map(partial(remove_bad_pixels, filtname=filtname), jhat_files))
 
@@ -188,20 +239,52 @@ def main():
         if config.stage3.skymatch_step.run:
             from .stage3 import skymatch_step
             for filtname in config.filters: 
-                jhat_files = utils.get_jhat_files(filtname)
+                jhat_files = utils.get_jhat_files(filtname, skip=files_to_skip)
                 skymatch_step(jhat_files, filtname)
 
         # outlier_step
         if config.stage3.outlier_step.run: 
             from .stage3 import outlier_step_prep, outlier_step
+            from astropy.io import fits
+            import tqdm
+
             for filtname in config.filters:
-                jhat_files = utils.get_jhat_files(filtname)
+                jhat_files = utils.get_jhat_files(filtname, skip=files_to_skip)
 
-                outlier_step_prep(jhat_files)
 
-                asn_files = utils.get_outlier_asn_files(filtname)
-                for asn_file in asn_files:
-                    outlier_step(asn_file, filtname)
+                visit_list = [] # list of all unique visit/sca (sensor chip assembly) combinations
+                jhat_sregions = []
+                for jhat_file in tqdm.tqdm(jhat_files):
+                    with fits.open(jhat_file) as f:
+                        jhat_sregions.append(f[1].header['S_REGION'])
+                    visit = os.path.basename(jhat_file).split('_')[0]
+                    if visit not in visit_list:
+                        visit_list.append(visit)
+                        
+                if config.stage3.outlier_step.pool:
+                    with mp.Pool(utils.n_procs) as pool:
+                        asn_files = pool.map(partial(outlier_step_prep, jhat_files=jhat_files, jhat_sregions=jhat_sregions, filtname=filtname), visit_list)
+                else:
+                    asn_files = []
+                    for visit in visit_list:
+                        asn_files.append(outlier_step_prep(visit, jhat_files=jhat_files, jhat_sregions=jhat_sregions, filtname=filtname))
+                
+                asn_files = [f for f in asn_files if f is not None]
+
+                asn_files_to_skip = utils.get_files(files_to_skip, config.stage3_product_path, filtname, prefix='outlier_detection_', suffix='*_asn.json', skip=None)
+                asn_files = [f for f in asn_files if f not in asn_files_to_skip]
+
+                if len(asn_files) > 0: 
+
+                    if config.stage3.outlier_step.pool:
+                        # note: maxtasksperchild=1, chunksize=1 helps with memory usage for intensive tasks
+                        # with mp.Pool(utils.n_procs//2, maxtasksperchild=1) as pool: # use fewer cores since outlier step can be memory intensive
+                        #     pool.map(partial(outlier_step, filtname=filtname), asn_files, chunksize=1)
+                        with mp.Pool(utils.n_procs//2) as pool: # use fewer cores since outlier step can be memory intensive
+                            pool.map(partial(outlier_step, filtname=filtname), asn_files)
+                    else:
+                        for asn_file in asn_files:
+                            outlier_step(asn_file, filtname)
 
 
         # resample_step

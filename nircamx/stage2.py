@@ -5,12 +5,13 @@ from datetime import datetime
 import numpy as np
 from numpy import ma
 import matplotlib.pyplot as plt
+from astropy.visualization import ImageNormalize, ZScaleInterval
 
 from scipy.ndimage import gaussian_filter
 from scipy.optimize import curve_fit
 from astropy.io import fits
 from astropy.nddata import block_reduce
-from astropy.stats import biweight_location, biweight_midvariance
+from astropy.stats import sigma_clip, biweight_location, biweight_midvariance, sigma_clipped_stats
 from .stage1 import calc_variance
 import warnings
 
@@ -64,6 +65,16 @@ def image2_step(rate_file):
                 'photom': {'skip': False},
                 'resample': {'skip': True}
               }}
+
+    if config.stage2.image2_step.use_custom_flat:
+        # jw01727028001_04101_00003_nrcalong_rate.fits
+        detector = rate_file_name.split('_')[-2]
+        flat_file = os.path.join(config.flats_path, f'flat_nircam_{filtname.upper()}_{detector.upper()}_CLEAR.fits')
+        if os.path.exists(flat_file):
+            kwargs['steps']['flat_field']['user_supplied_flat'] = flat_file
+        else:
+            logger.warning(f'Flat file {os.path.basename(flat_file)} was not found in {config.flats_path}')
+            logger.warning(f'Falling back to CRDS flats')
 
     
     try:
@@ -133,8 +144,8 @@ def remove_edge(cal_file):
                 else:
                     index_end = 1
 
-        cal_file_without_edgeremoval = cal_file.replace('_cal.fits', '_before_removing_edge.fits')
-        shutil.copy2(cal_file, cal_file_without_edgeremoval)
+        # cal_file_without_edgeremoval = cal_file.replace('_cal.fits', '_before_removing_edge.fits')
+        # shutil.copy2(cal_file, cal_file_without_edgeremoval)
 
         time = datetime.now()
         stepdescription = f"Removed edges; {time.strftime('%Y-%m-%d %H:%M:%S')}"
@@ -156,6 +167,7 @@ def apply_masks(cal_file):
         return 
 
     flag = config.stage2.apply_mask_step.mask_flag
+    set_to_nan = config.stage2.apply_mask_step.mask_set_nan
     logger.info(f'Applying mask to {cal_file_name}')
     from jwst.datamodels import ImageModel
     with ImageModel(cal_file) as model:
@@ -169,8 +181,15 @@ def apply_masks(cal_file):
             reg = reg.to_pixel(wcs)
             mask = reg.to_mask(mode='center')
             mask = mask.to_image(shape)
-            mask = (mask*flag).astype('uint32')
+            try:
+                mask = mask.astype(bool)
+            except:
+                continue
+            
+            if set_to_nan:
+                model.data[mask] = np.nan
 
+            mask = (mask*flag).astype('uint32')
             model.dq |= mask
         
         model.save(cal_file)
@@ -367,16 +386,71 @@ def apply_masks(cal_file):
 
 
 
-def background_subtraction_variance_scaling(cal_file):
+def sky_subtraction(cal_file):
+    '''Subtract a constant sky pedestal value from the cal file'''
+    from stdatamodels import util as stutil
+    from jwst.datamodels import ImageModel
+    
+    overwrite = config.stage2.skysub_step.overwrite
+    with ImageModel(cal_file) as model:
+        for entry in model.history:
+            if 'Removed sky' in entry['description'] and not overwrite:
+                logger.info(f'Sky subtraction already done for {os.path.basename(cal_file)}, skipping...')
+                return
+
+    logger.info(f'Running sky subtraction on {os.path.basename(cal_file)}')
+
+    with ImageModel(cal_file) as model:
+        sci = model.data
+        dq = model.dq
+
+        # Read in mask created during 1/f correction
+        srcmask = cal_file.replace(config.stage2_product_path, config.stage1_product_path)
+        srcmask = srcmask.replace('_cal.fits', '_rate_1fmask.fits')
+        logger.info(f'Using existing source mask {os.path.basename(srcmask)}')
+        seg = fits.getdata(srcmask)
+        w = np.where((dq == 0) & (seg == 0))
+        data = sci[w].flatten()
+        
+        # Apply a sigma clip to the data
+        data = sigma_clip(data, sigma_upper=3, sigma_lower=10, maxiters=5, masked=False)
+        data = data[~np.isinf(data) & ~np.isnan(data)]
+        
+        # Fit the pedestal
+        from .stage1 import fit_sky_tot
+        try:
+            sky = fit_sky_tot(data)
+        except:
+            print(f'Failed on {cal_file}!!')
+            raise
+
+        # Subtract off sky    
+        model.data -= sky
+
+        # Update header
+        model.meta.background.level = sky
+        model.meta.background.subtracted = True
+        model.meta.background.method = 'local'
+        
+        logger.info(f"Saving to {os.path.basename(cal_file)}")
+        time = datetime.now()
+        stepdescription = f"Removed sky {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        substr = stutil.create_history_entry(stepdescription)
+        model.history.append(substr)
+    
+        model.save(cal_file)
+
+
+def rescale_variance(cal_file):
     '''
-     Perform background subtraction and variance map scaling 
+    Perform variance map scaling 
     This routine models the 2D background of an individual exposure and rescales 
     the variance maps to match the measured variance of background pixels
     
      1. Run a background subtraction routine that creates a 2D model of 
         the background in an image. This will be used to calculate the 
-        sky variance. This background subtraction routine can oversubtract 
-        in regions around extended/low surface brightness sources
+        sky variance. 
+        
      2. Rescale the variance maps. Determines a robust sky variance in the
         image and scales the VAR_RNOISE array to reproduce this value. The 
         VAR_RNOISE arrays are used for inverse variance weighting during 
@@ -386,50 +460,43 @@ def background_subtraction_variance_scaling(cal_file):
     from stdatamodels import util as stutil
     from jwst.datamodels import ImageModel
     
-    overwrite = config.stage2.bkgsub_var_step.overwrite
+    overwrite = config.stage2.variance_step.overwrite
     with ImageModel(cal_file) as model:
         for entry in model.history:
-            if 'Removed background, rescaled variance maps' in entry['description'] and not overwrite:
-                logger.info(f'Background subtraction/variance map rescaling already done for {os.path.basename(cal_file)}, skipping...')
+            if 'Rescaled variance' in entry['description'] and not overwrite:
+                logger.info(f'Variance rescaling already done for {os.path.basename(cal_file)}, skipping...')
                 return
 
-    logger.info(f'Running background subtraction and variance scaling on {os.path.basename(cal_file)}')
+    logger.info(f'Rescaling variance for {os.path.basename(cal_file)}')
 
-
+    # Run a full 2D background subtraction routine
     from .bkgsub import SubtractBackground
-
     bkg = SubtractBackground(
-        ring_radius_in = config.stage2.bkgsub_var_step.ring_radius_in,
-        ring_width = config.stage2.bkgsub_var_step.ring_width,
-        ring_clip_max_sigma = config.stage2.bkgsub_var_step.ring_clip_max_sigma,
-        ring_clip_box_size = config.stage2.bkgsub_var_step.ring_clip_box_size,
-        ring_clip_filter_size = config.stage2.bkgsub_var_step.ring_clip_filter_size,
-        tier_kernel_size = config.stage2.bkgsub_var_step.tier_kernel_size,
-        tier_npixels = config.stage2.bkgsub_var_step.tier_npixels,
-        tier_nsigma = config.stage2.bkgsub_var_step.tier_nsigma,
-        tier_dilate_size = config.stage2.bkgsub_var_step.tier_dilate_size,
-        bg_box_size = config.stage2.bkgsub_var_step.bg_box_size,
-        bg_filter_size = config.stage2.bkgsub_var_step.bg_filter_size,
-        bg_exclude_percentile = config.stage2.bkgsub_var_step.bg_exclude_percentile,
-        bg_sigma = config.stage2.bkgsub_var_step.bg_sigma,
-        bg_interpolator = config.stage2.bkgsub_var_step.bg_interpolator,
+        ring_radius_in = config.stage2.variance_step.ring_radius_in,
+        ring_width = config.stage2.variance_step.ring_width,
+        ring_clip_max_sigma = config.stage2.variance_step.ring_clip_max_sigma,
+        ring_clip_box_size = config.stage2.variance_step.ring_clip_box_size,
+        ring_clip_filter_size = config.stage2.variance_step.ring_clip_filter_size,
+        tier_kernel_size = config.stage2.variance_step.tier_kernel_size,
+        tier_npixels = config.stage2.variance_step.tier_npixels,
+        tier_nsigma = config.stage2.variance_step.tier_nsigma,
+        tier_dilate_size = config.stage2.variance_step.tier_dilate_size,
+        bg_box_size = config.stage2.variance_step.bg_box_size,
+        bg_filter_size = config.stage2.variance_step.bg_filter_size,
+        bg_exclude_percentile = config.stage2.variance_step.bg_exclude_percentile,
+        bg_sigma = config.stage2.variance_step.bg_sigma,
+        bg_interpolator = config.stage2.variance_step.bg_interpolator,
         suffix = 'bkgsub',
         replace_sci = True,
     )
+    try:
+        bkg.call(cal_file)
+    except:
+        print(f"!!! failed on {cal_file}")
+        raise
 
-    bkg.call(cal_file)
-
-    cal_file_orig = cal_file.replace('_cal.fits', '_cal_before_bkgsub.fits')
-    logger.info(f"Copying input to {os.path.basename(cal_file_orig)}")
-    shutil.copy2(cal_file, cal_file_orig)
-
-    logger.info(f"Renaming {os.path.basename(bkg.outfile)} to {os.path.basename(cal_file)}")
-    shutil.move(bkg.outfile, cal_file)
-
-    # from here on, operate on the background-subtracted file
     # rescale variance maps
-    logger.info(f"Rescaling variance for {os.path.basename(cal_file)}")
-    block_size = config.stage2.bkgsub_var_step.block_size
+    block_size = config.stage2.variance_step.block_size
     with ImageModel(cal_file) as model:
         sci = model.data
         var_rnoise = model.var_rnoise
@@ -458,7 +525,7 @@ def background_subtraction_variance_scaling(cal_file):
         logger.info(f"Robust masked mean SKY_VARIANCE: {skyvar:.3e}")
         logger.info(f"Correction factor: {correction_factor:.2f}")
         logger.info(f"Fraction of pixels unmasked: {unmasked_frac*100:.1f}%")
-            
+                
 
         ### fix holes in variance maps, not sure if this is still necessary
         rnoise = model.var_rnoise
@@ -481,32 +548,27 @@ def background_subtraction_variance_scaling(cal_file):
 
         logger.info(f"Saving to {os.path.basename(cal_file)}")
         time = datetime.now()
-        stepdescription = f"Removed background, rescaled variance maps {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        stepdescription = f"Rescaled variance {time.strftime('%Y-%m-%d %H:%M:%S')}"
         substr = stutil.create_history_entry(stepdescription)
         model.history.append(substr)
     
         model.save(cal_file)
 
-    if config.stage2.bkgsub_var_step.plot:
-        cal_file_name = os.path.basename(cal_file)
-        logger.info(f'Making cal_rate plot for {cal_file_name}')
-        rate_file = cal_file.replace(config.stage2_product_path, config.stage1_product_path).replace('_cal.fits','_rate.fits')
-        output_file = cal_file.replace('_cal.fits','_cal_rate_fig.pdf')
-        utils.plot_two(rate_file, cal_file ,title1='Rate',title2='Cal (Background-subtracted)', save_file=output_file)
+    try:
+        os.remove(cal_file.replace('_cal.fits', '_cal_bkgsub.fits'))
+    except OSError:
+        pass
 
 
-        plot_cal_mask(cal_file)
-
-
-import numpy as np
-import os, glob, tqdm
-import matplotlib.pyplot as plt
-from astropy.io import fits
-from astropy.visualization import ImageNormalize, ZScaleInterval
-
-def plot_cal_mask(cal_file):
-    outfile = os.path.join('/n23data2/hakins/jwst/scripts/f150w_cal_files/', os.path.basename(cal_file).replace('_cal.fits','.png'))
-    print(outfile)
+def plot_cal_rate(cal_file):
+    # cal_file_name = os.path.basename(cal_file)
+    # logger.info(f'Making cal_rate plot for {cal_file_name}')
+    # rate_file = cal_file.replace(config.stage2_product_path, config.stage1_product_path).replace('_cal.fits','_rate.fits')
+    # output_file = cal_file.replace('_cal.fits','_cal_rate_fig.pdf')
+    # utils.plot_two(rate_file, cal_file ,title1='Rate',title2='Cal (Background-subtracted)', save_file=output_file)
+    
+    outfile = cal_file.replace('_cal.fits','_cal.png')
+    logger.info(outfile)
     im = fits.getdata(cal_file, 'SCI')
     dq = fits.getdata(cal_file, 'DQ') 
     mask = dq > 0 
@@ -522,4 +584,207 @@ def plot_cal_mask(cal_file):
     plt.close()
 
         
+
+
+def create_diagonal_bins(image_shape, bin_width, theta):
+    """
+    Create diagonal bins across an image at angle theta.
+    
+    Parameters:
+    -----------
+    image_shape : tuple
+        Shape of the image (height, width)
+    bin_width : float
+        Width of each diagonal bin in pixels
+    theta : float
+        Angle in degrees relative to the x-axis
+    
+    Returns:
+    --------
+    bin_indices : numpy.ndarray
+        2D array where each pixel contains its bin index
+    """
+    theta = np.radians(theta)  # Convert angle to radians
+
+    height, width = image_shape
+    
+    # Create coordinate grids
+    y, x = np.meshgrid(np.arange(height), np.arange(width), indexing='ij')
+    
+    # Rotate coordinates: project onto axis perpendicular to diagonal direction
+    # The perpendicular direction is at angle (theta + π/2)
+    perpendicular_angle = theta + np.pi/2
+    
+    # Project coordinates onto the perpendicular axis
+    # This gives us the distance from each pixel to the diagonal lines
+    projected_coords = x * np.cos(perpendicular_angle) + y * np.sin(perpendicular_angle)
+    
+    # Find the range of projected coordinates to handle negative values
+    min_proj = np.min(projected_coords)
+    
+    # Shift coordinates to make them all positive, then divide by bin_width
+    bin_indices = ((projected_coords - min_proj) / bin_width).astype(int)
+    
+    return bin_indices
+
+def get_pixels_in_bin(image, bin_indices, bin_number):
+    """Get all pixels that belong to a specific bin"""
+    mask = (bin_indices == bin_number)
+    return image[mask]
+
+def create_median_bin_image(image, bin_indices, sigma=3, maxiters=5, num_pixel_threshold=0):
+    """
+    Create an image where each pixel is replaced with the median value from its bin.
+    
+    Parameters:
+    -----------
+    image : numpy.ndarray
+        Original image array
+    bin_indices : numpy.ndarray
+        2D array of bin indices from create_diagonal_bins()
+    
+    Returns:
+    --------
+    median_image : numpy.ndarray
+        Image where each pixel contains the median value from its diagonal bin
+    """
+    # Initialize output image with same shape and dtype as input
+    median_image = np.zeros_like(image)
+    
+    # Get unique bin numbers
+    unique_bins = np.unique(bin_indices)
+    
+    # Calculate median for each bin and assign to all pixels in that bin
+    for bin_num in unique_bins:
+        mask = (bin_indices == bin_num)
+        bin_pixels = image[mask]
+        if len(bin_pixels) < num_pixel_threshold:
+            # print(f"Bin {bin_num} has fewer than {num_pixel_threshold} pixels, skipping median calculation.")
+            continue
+        median_value = sigma_clipped_stats(bin_pixels, mask=~np.isfinite(bin_pixels), maxiters=maxiters, sigma=sigma)[1]
+
+        median_image[mask] = median_value
+    
+    return median_image
+
+
+def fast_variance_objective(theta, image, bin_width):
+    """
+    Fast computation of variance for optimization.
+    """
+
+    theta = np.radians(theta)  # Convert angle to radians
+
+    height, width = image.shape
+    
+    # Create coordinate grids
+    y, x = np.meshgrid(np.arange(height), np.arange(width), indexing='ij')
+    
+    # Project coordinates
+    perpendicular_angle = theta + np.pi/2
+    projected_coords = x * np.cos(perpendicular_angle) + y * np.sin(perpendicular_angle)
+    
+    # Create bins
+    min_proj = np.min(projected_coords)
+    bin_indices = ((projected_coords - min_proj) / bin_width).astype(int)
+    
+    # Calculate variance efficiently
+    total_variance = 0.0
+    unique_bins = np.unique(bin_indices)
+    
+    for bin_num in unique_bins:
+        mask = (bin_indices == bin_num)
+        bin_pixels = image[mask]
+        if len(bin_pixels) > 1:
+            median_val = sigma_clipped_stats(bin_pixels, mask=~np.isfinite(bin_pixels), maxiters=5, sigma=3)[1]
+            variance = calc_variance(bin_pixels, median_val, 1)
+            total_variance += variance
+    
+    return total_variance
+
+def remove_diagonal_striping(image):
+    """    
+    Subtract diagonal parallel striping features present in PRIMER UDS observations
+    Implements a similar algorithm to the subtraction of 1/f noise, but uses diagonal 
+    apertures rather than row-by-row subtraction
+
+    """
+    
+    plot = config.stage2.remove_diagonal_striping_step.plot
+    theta_min = config.stage2.remove_diagonal_striping_step.theta_min
+    theta_max = config.stage2.remove_diagonal_striping_step.theta_max
+    theta_step = config.stage2.remove_diagonal_striping_step.theta_step
+    bin_width = config.stage2.remove_diagonal_striping_step.bin_width
+
+    from jwst.datamodels import ImageModel
+    model = ImageModel(image)
+    # check that image has not already been corrected
+    for entry in model.history:
+        if 'Removed diagonal striping' in entry['description']:
+            logger.info(f'{image} already corrected for diagonal striping patterns, exiting')
+            return
+
+    logger.info('Measuring diagonal striping')
+    logger.info(f'Working on {image}')
+
+    mask = np.zeros(model.data.shape, dtype=bool)
+    mask[model.dq > 0] = True
+
+    thetas = np.arange(theta_min, theta_max+theta_step, theta_step)
+    variance = np.zeros_like(thetas)
+    for i, theta_i in enumerate(thetas):
+        logger.info(f'Testing {i+1}/{len(thetas)}: {theta_i:.2f} degrees')
+        variance[i] = fast_variance_objective(theta_i, model.data, bin_width)
+
+    min_variance = np.min(variance)
+    theta = thetas[np.argmin(variance)]
+    logger.info(f"Optimized angle: {theta:.2f} degrees, Variance: {min_variance:.2e}")
+
+    bins = create_diagonal_bins(np.shape(model.data), bin_width, theta)
+    med = create_median_bin_image(model.data, bins)
+
+    model.close()
+    
+    image_orig = image.replace('.fits', '_before_diag_sub.fits')
+    logger.info(f"Copying input to {image_orig}")
+    shutil.copy2(image, image_orig)
+
+    # remove striping from science image
+    with ImageModel(image) as immodel:
+        sci = immodel.data
+        # to replace zeros
+        wzero = np.where(sci == 0)
+        outsci = sci - med
+        outsci[wzero] = 0
+        
+        # write output
+        immodel.data = outsci
+        # add history entry
+        time = datetime.now()
+        stepdescription = f"Removed diagonal striping; {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        from stdatamodels import util as stutil
+        substr = stutil.create_history_entry(stepdescription)
+        immodel.history.append(substr)
+        logger.info(f'Saving cleaned image to {image}')
+        immodel.save(image)
+
+    if plot:
+        logger.info(f'Making diagonal striping removal plots')
+
+        import matplotlib.pyplot as plt
+        plt.figure()
+        plt.plot(thetas, variance, marker='o')
+        plt.gca().axvline(theta, color='r', linestyle='--')
+        plt.xlabel('Theta (degrees)')
+        plt.ylabel('Variance')
+        output_file = image.replace('_cal.fits', '_diag_striping_variance.pdf')
+        plt.savefig(output_file)
+        plt.close()
+        logger.info(f'Saved plot to {output_file}')
+
+        image_name = os.path.basename(image)
+        image_orig  = image.replace('_cal.fits', '_cal_before_diag_sub.fits')
+        output_file = image.replace('_cal.fits','_diag_striping.pdf')
+        utils.plot_three(image_orig, med, image , title1='Original', title2='Stripes', title3='Stripes removed', scaling=3, save_file=output_file)
+        logger.info(f'Saved plot to {output_file}')
 
